@@ -139,20 +139,47 @@ jobs:
       # Release.xcconfig 里 -force_load / DEAD_CODE_STRIPPING=NO /
       # -Wl,-export_dynamic 三件套缺任何一个,这里就会失败——
       # 与其出「装上闪退」的包,不如现在硬错。
-      # macOS 符号带下划线前缀（_store_dart_post_cobject）,模式里容掉。
+      #
+      # 为什么不用 nm 做主判据（v1 的教训）:iOS Release 安装期可能 strip 掉
+      # 符号表,此时 nm 看不到任何符号,但 dlsym 实际解析走的是 dyld export
+      # trie——导出符号名在那里仍以字符串存在,App 运行完全正常。nm 误报会让
+      # 构建白白失败。所以主判据改为对二进制的字节级检查（grep -a）:符号
+      # 名字节串要么在 symtab 字符串表、要么在 export trie 里,链接成功则
+      # 必然存在;静态库没链进去则必然不存在。nm 输出降级为诊断证据,
+      # 随 artifact 上传,失败时人工核对有据可查。
       - name: Verify the Rust core is linked into Runner
         run: |
-          set -euo pipefail
+          set -uo pipefail
           bin="build/ios/iphoneos/Runner.app/Runner"
           test -s "$bin" || { echo "未找到主二进制 $bin" >&2; exit 1; }
+          mkdir -p build/ci-artifacts
+          report="build/ci-artifacts/link-verify.txt"
+          {
+            printf 'binary: %s\n' "$bin"
+            ls -lh "$bin"
+            printf 'nm 可见符号总数: %s\n' "$(nm "$bin" 2>&1 | grep -c . || true)"
+            printf '\n== nm 输出采样（前 40 行,诊断用）==\n'
+            nm "$bin" 2>&1 | head -40 || true
+            printf '\n== 符号检查结果 ==\n'
+          } > "$report"
+          missing=0
           for symbol in frb_get_rust_content_hash store_dart_post_cobject; do
-            if ! nm "$bin" 2>/dev/null | grep -Eq "[[:space:]]_?${symbol}$"; then
-              echo "Runner 主二进制里缺少 Rust 桥接符号: $symbol" >&2
-              echo '多半是 Release.xcconfig 的链接三件套（-force_load / DEAD_CODE_STRIPPING / export_dynamic）没生效。' >&2
-              exit 1
+            nm_hit="$(nm "$bin" 2>/dev/null | grep -c "$symbol" || true)"
+            # grep -a:按文本处理二进制;符号名在 symtab 字符串表或 export
+            # trie 中均以连续字节串出现,命中即说明符号进了最终产物。
+            raw_hit="$(grep -a -c -F "$symbol" "$bin" || true)"
+            printf '%s: nm命中=%s 二进制字节命中=%s\n' "$symbol" "$nm_hit" "$raw_hit" | tee -a "$report"
+            if [ "$raw_hit" -eq 0 ] && [ "$nm_hit" -eq 0 ]; then
+              missing=1
             fi
-            printf 'symbol ok: %s\n' "$symbol"
           done
+          if [ "$missing" -ne 0 ]; then
+            echo 'Runner 主二进制里找不到 Rust 桥接符号:静态库多半没有被链接进去。' >&2
+            echo '诊断信息已写入 build/ci-artifacts/link-verify.txt,随 artifact 上传。' >&2
+            cat "$report" >&2
+            exit 1
+          fi
+          echo 'Rust 桥接符号已确认存在于主二进制。'
 
       # IOS.md「打包成未签名 IPA」原文流程:Payload 目录 + zip。
       # 用 ditto 而不是 cp -R,保留 .app 里的符号链接与权限位。
@@ -187,6 +214,7 @@ jobs:
           path: |
             build/ci-artifacts/fqapp_ios_unsigned.ipa
             build/ci-artifacts/build-info.txt
+            build/ci-artifacts/link-verify.txt
 
       - name: Write download summary
         env:
