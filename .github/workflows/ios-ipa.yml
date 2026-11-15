@@ -1,0 +1,203 @@
+# iOS 未签名 IPA 构建流水线。
+#
+# 仓库此前只有 android-apk / windows / linux 三个工作流,iOS 适配
+# （rust 静态库链接、xcconfig、降级逻辑）已在代码里完成但一直没有 CI。
+# 本工作流按 IOS.md 的构建步骤逐条落成 CI 步骤,产出「未签名 IPA」,
+# 由使用者用 Sideloadly / AltStore 等工具自签后装到 iPhone。
+#
+# 为什么不直接签名:DEVELOPMENT_TEAM 是个人凭据,不能入库（IOS.md「签名」一节），
+# 公开流水线只能出未签名包——这与 android-apk.yml 对 fork PR 的降级策略一致。
+name: iOS IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master, listen-follow, listen-follow-ex]
+    # 打 tag 也出包,与 android-apk.yml 同理:推 v* 即可在 Artifacts 拿到 IPA。
+    tags: ['v*']
+    paths: &ios_paths
+      - 'lib/**'
+      - 'ios/**'
+      - 'rust/**'
+      - 'assets/**'
+      - 'pubspec.yaml'
+      - 'pubspec.lock'
+      - 'analysis_options.yaml'
+      - 'rustfmt.toml'
+      - 'flutter_rust_bridge.yaml'
+      - '.cargo/config.toml'
+      - 'scripts/build_rust_ios.sh'
+      - 'scripts/generate_ios_app_icon.py'
+      - '.github/workflows/ios-ipa.yml'
+  pull_request:
+    paths: *ios_paths
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # 与 pubspec.lock 及 android-apk.yml / windows.yml / linux.yml 保持同一工具链。
+  FLUTTER_VERSION: '3.50.0'
+  # dtolnay/rust-toolchain 锁具体版本,不用漂浮的 stable(理由见 android-apk.yml)。
+  RUST_VERSION: '1.99.1'
+  # 出 IPA 只需真机 arm64 片;模拟器片（aarch64-apple-ios-sim / x86_64-apple-ios）
+  # 只在本地开发用,CI 不编,省 20 分钟以上。
+  RUST_IOS_TARGET: 'aarch64-apple-ios'
+  # Podfile.lock 记录的生成版本。低于它会收到 pod 的版本告警,所以对齐它。
+  COCOAPODS_VERSION: '1.17.0'
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ipa:
+    # iOS 构建离不开 macOS + Xcode,Xcode 不出 macOS。公开仓库跑托管
+    # macOS runner 免费;私有仓库按 10x 计费,自行斟酌。
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out app source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Compute artifact identifiers
+        id: artifact-ids
+        run: |
+          # 与 android-apk.yml 同一约定:ref 里的 '/' 是非法字符,sanitize 掉;
+          # run_number 保留,重跑不冲突。
+          printf 'safe_ref=%s\n' "${GITHUB_REF_NAME//\//-}" >> "$GITHUB_OUTPUT"
+          printf 'short_sha=%s\n' "${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+
+      - name: Install the pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: ${{ env.RUST_IOS_TARGET }}
+
+      - name: Cache the Cargo build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: rust
+
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      # IOS.md「iOS 专用改动」第 5 条:Xcode 27 + SPM 有已知构建失败,先关掉。
+      - name: Disable Swift Package Manager
+        run: flutter config --no-enable-swift-package-manager --no-analytics
+
+      # IOS.md 锁的是 Xcode 27.2。镜像带的 Xcode 随时间变化,这里选「已装的
+      # 最新 27.x」而不是死锁 27.2;没有 27.x 时大声警告再继续——继续是因为
+      # Flutter 自己会给出明确的版本不兼容报错,比在这里盲猜失败原因更可读。
+      - name: Select the newest installed Xcode 27.x
+        run: |
+          set -euo pipefail
+          printf '镜像里可用的 Xcode:\n'
+          ls -d /Applications/Xcode*.app 2>/dev/null || printf '  (none found)\n'
+          newest="$(ls -d /Applications/Xcode_27*.app 2>/dev/null | sort -V | tail -1 || true)"
+          if [ -n "$newest" ]; then
+            sudo xcode-select -s "$newest"
+            printf 'Selected: %s\n' "$newest"
+          else
+            printf '::warning::镜像里没有 Xcode 27.x,使用默认 Xcode 继续。IOS.md 要求 27.2,若不兼容,flutter build 会以明确的错误失败。\n'
+          fi
+          xcodebuild -version
+
+      # Podfile.lock 生成于 CocoaPods 1.17.0。镜像通常预装 CocoaPods,只在
+      # 缺失或版本更旧时才补装,避免每次构建白付一次 gem/brew 的安装时间。
+      - name: Ensure CocoaPods >= ${{ env.COCOAPODS_VERSION }}
+        run: |
+          installed="$(pod --version 2>/dev/null || true)"
+          printf 'CocoaPods on image: %s\n' "${installed:-missing}"
+          lowest="$(printf '%s\n%s\n' "${installed:-0}" "$COCOAPODS_VERSION" | sort -V | head -1)"
+          if [ -z "$installed" ] || [ "$lowest" != "$COCOAPODS_VERSION" ]; then
+            printf '镜像 CocoaPods 过旧或缺失,补装 %s…\n' "$COCOAPODS_VERSION"
+            sudo gem install cocoapods -v "$COCOAPODS_VERSION" --no-document
+            pod --version
+          fi
+
+      - name: Resolve Dart package dependencies
+        run: flutter pub get --enforce-lockfile
+
+      # Rust 核心 → ios/Frameworks/libfqapi_core.a（staticlib）。脚本内部
+      # 依赖 cargo + xcrun,并导出 CARGO_PROFILE_RELEASE_STRIP=debuginfo
+      # 保留符号（release 的 strip=true 会裁掉,dlsym 会找不到入口）。
+      # git 里该脚本无执行位,必须用 bash 调起。
+      - name: Compile the Rust core for iOS (staticlib)
+        run: bash scripts/build_rust_ios.sh
+
+      - name: Build the iOS app (release, no codesign)
+        run: flutter build ios --release --no-codesign
+
+      # Rust 核心链接门,与 android-apk.yml 的 .so 符号检查对齐:
+      # Release.xcconfig 里 -force_load / DEAD_CODE_STRIPPING=NO /
+      # -Wl,-export_dynamic 三件套缺任何一个,这里就会失败——
+      # 与其出「装上闪退」的包,不如现在硬错。
+      # macOS 符号带下划线前缀（_store_dart_post_cobject）,模式里容掉。
+      - name: Verify the Rust core is linked into Runner
+        run: |
+          set -euo pipefail
+          bin="build/ios/iphoneos/Runner.app/Runner"
+          test -s "$bin" || { echo "未找到主二进制 $bin" >&2; exit 1; }
+          for symbol in frb_get_rust_content_hash store_dart_post_cobject; do
+            if ! nm "$bin" 2>/dev/null | grep -Eq "[[:space:]]_?${symbol}$"; then
+              echo "Runner 主二进制里缺少 Rust 桥接符号: $symbol" >&2
+              echo '多半是 Release.xcconfig 的链接三件套（-force_load / DEAD_CODE_STRIPPING / export_dynamic）没生效。' >&2
+              exit 1
+            fi
+            printf 'symbol ok: %s\n' "$symbol"
+          done
+
+      # IOS.md「打包成未签名 IPA」原文流程:Payload 目录 + zip。
+      # 用 ditto 而不是 cp -R,保留 .app 里的符号链接与权限位。
+      - name: Pack the unsigned IPA
+        run: |
+          set -euo pipefail
+          pack="$RUNNER_TEMP/pack"
+          rm -rf "$pack" && mkdir -p "$pack/Payload"
+          ditto build/ios/iphoneos/Runner.app "$pack/Payload/Runner.app"
+          ( cd "$pack" && zip -qry "$RUNNER_TEMP/fqapp_ios_unsigned.ipa" Payload )
+          mkdir -p build/ci-artifacts
+          cp "$RUNNER_TEMP/fqapp_ios_unsigned.ipa" build/ci-artifacts/
+          {
+            printf 'App commit: %s\n' "$GITHUB_SHA"
+            printf 'Flutter: %s\n' "$FLUTTER_VERSION"
+            printf 'Rust core: fqapi_core staticlib (%s, %s)\n' "$RUST_VERSION" "$RUST_IOS_TARGET"
+            printf 'IPA SHA-256: %s\n' "$(shasum -a 256 build/ci-artifacts/fqapp_ios_unsigned.ipa | cut -d ' ' -f 1)"
+            printf 'IPA size: %s\n' "$(ls -lh build/ci-artifacts/fqapp_ios_unsigned.ipa | awk '{print $5}')"
+            printf '未签名构建:需自签后安装（Sideloadly / AltStore;免费 Apple ID 7 天有效）。\n'
+            printf '已知限制（见 IOS.md）:短剧/漫剧视频与系统朗读在 iOS 上不可用。\n'
+            flutter --version
+          } > build/ci-artifacts/build-info.txt
+
+      - name: Upload the unsigned IPA
+        id: artifact-ipa
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fqapp-ios-unsigned-${{ steps.artifact-ids.outputs.safe_ref }}-${{ steps.artifact-ids.outputs.short_sha }}-${{ github.run_number }}
+          retention-days: 14
+          if-no-files-found: error
+          compression-level: 0
+          path: |
+            build/ci-artifacts/fqapp_ios_unsigned.ipa
+            build/ci-artifacts/build-info.txt
+
+      - name: Write download summary
+        env:
+          ARTIFACT_URL: ${{ steps.artifact-ipa.outputs.artifact-url }}
+        run: |
+          {
+            printf '[下载未签名 IPA（fqapp_ios_unsigned.ipa）](%s)\n\n' "$ARTIFACT_URL"
+            printf 'App commit: `%s`\n\n' "$GITHUB_SHA"
+            printf '这是**未签名** IPA,不能直接安装。两条路:\n\n'
+            printf '1. **Sideloadly（Windows/macOS）**:数据线连 iPhone,IPA 拖进 Sideloadly,填 Apple ID 开始签名安装。免费 Apple ID 签名 7 天有效,过期重签一次即可。\n'
+            printf '2. **AltStore**:装 AltServer 后同上,还能自动续签。\n\n'
+            printf '安装后首次打开若提示「不受信任的开发者」,去 设置 → 通用 → VPN与设备管理 信任对应描述文件。\n\n'
+            printf '已知限制（见 IOS.md）:短剧/漫剧视频、系统朗读暂不可用;看书、听书（真人有声）、书架、缓存可用。\n'
+          } >> "$GITHUB_STEP_SUMMARY"
